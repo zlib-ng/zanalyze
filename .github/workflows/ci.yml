@@ -25,12 +25,13 @@ jobs:
         run: pylint zanalyze.py test_zanalyze.py
 
   test:
-    name: Tests (zlib-ng ${{ matrix.ref }})
+    name: Tests (zlib-ng ${{ matrix.ref }}, ${{ matrix.python }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         ref: [develop]
+        python: ["3.12", "pypy3.11"]
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
@@ -53,7 +54,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
       - name: Run tests
         env:
           ZANALYZE_TEST_DATA: ${{ github.workspace }}/zlib-ng/test/data/lcet10.txt

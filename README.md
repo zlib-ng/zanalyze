@@ -12,8 +12,8 @@ Single-file python script. No third-party dependencies.
 ## Features
 
 - **Full deflate parser** — decode every stored/dynamic/fixed block, every
-  match (length + distance) and literal run, straight from `z_stream`
-  `next_in`/`total_out`, and cross-check by re-inflating with system zlib.
+  match (length + distance) and literal run, and cross-check by
+  re-inflating with system zlib.
 - **Report of record** — per-file summary (sizes, ratios, blocks), an optional
   per-event match/literal listing, match-length and match-distance
   histograms, a 2-D **match distance x length map**, a **match economics**
@@ -34,10 +34,11 @@ Single-file python script. No third-party dependencies.
 
 ## Requirements
 
-- Python **3.10+** (standard library only; CI runs on 3.12, also verified on
+- Python **3.10+** (standard library only; CI runs the suite on 3.12 and
   PyPy 3.11).
 - A zlib or zlib-ng **shared library** (`libz.so` / `libz-ng.so`) to drive
-  compression. `analyze-file` mode uses system zlib to recover the source.
+  compression. `analyze-file` mode uses system zlib to recover the source;
+  `dump-file` never does (its parser reconstructs the source itself).
 - The libraries are loaded with `RTLD_LOCAL | RTLD_DEEPBIND`, so several
   builds can coexist in one process — handy for `diff`.
 
@@ -60,6 +61,13 @@ python3 zanalyze.py analyze --lib build-develop/libz-ng.so lcet10.txt --events -
 python3 zanalyze.py analyze-file data.gz
 python3 zanalyze.py analyze-file image.png
 python3 zanalyze.py analyze-file archive.zip
+python3 zanalyze.py analyze-file archive.zip --zip-entry 2   # analyze only entry 2
+
+# dump-file: full per-event listing of an existing stream (parser-only,
+# never touches system zlib — the source is reconstructed internally)
+python3 zanalyze.py dump-file data.gz --max-events 100
+python3 zanalyze.py dump-file image.png
+python3 zanalyze.py dump-file archive.zip --zip-entry 2   # entry list first
 
 # diff two libraries (comma form)
 python3 zanalyze.py diff --lib build-develop/libz-ng.so,build-pr/libz-ng.so lcet10.txt
@@ -74,10 +82,7 @@ python3 zanalyze.py analyze --lib build-develop/libz-ng.so lcet10.txt --json
 
 ## Screenshots
 
-The match-length/distance analysis and the match-cost report are the heart of
-the tool, so they deserve the color treatment (256-color cells, forced on with
-`--map-colors-on`). Generated with
-[`freeze`](https://github.com/charmbracelet/freeze).
+Generated with [`freeze`](https://github.com/charmbracelet/freeze).
 
 ### `analyze` — match map + match economics + cost map
 
@@ -132,7 +137,15 @@ their own layouts), and output stays 2-space indented. In document order:
 
 The per-event listing (`--events`) shows the raw decision stream: `L count`
 for a literal run, `M length dist` for a match — the same events `diff` aligns
-to find divergences.
+to find divergences. `dump-file` prints that listing **untruncated** (every
+literal byte in full hex) for an existing file without a library or system
+zlib on the path at all; cap the output with `--max-events`, and pick a
+`.zip`/`.jar`/`.apk` entry with `--zip-entry N` (the bare command lists the
+entries and exits non-zero). `analyze-file` accepts the same `--zip-entry N`
+(optional) to focus the whole report — summary, histograms, map, economics,
+Huffman, and the `--events` listing — on that single deflate entry instead of
+the whole-archive aggregate; a stored/out-of-range entry or a non-zip file
+errors.
 
 ## Options at a glance
 
@@ -144,6 +157,9 @@ to find divergences.
 - `--map-colors-on / --map-colors-off` — force map cell colorization on or off
   (otherwise auto-detected from the terminal).
 - `--sweep --levels 1,3,5-9` — compact per-level diff report.
+- `--max-events N` — cap the per-event listing / `dump-file` output.
+- `--zip-entry N` — `dump-file` on a zip: dump only entry N; `analyze-file` on
+  a zip: analyze only that deflate entry (optional there).
 - `--json [--json-full]` — machine-readable output, uncapped.
 - `--no-progress` — disable the stderr decode progress bar.
 

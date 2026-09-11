@@ -34,6 +34,11 @@ entries of a .zip/.jar/.apk, aggregated across entries and showing per-entry
 stats), recovering the original input with system zlib and cross-checking the
 internal parser against it (no library is needed to compress).
 
+A fourth mode (dump-file) prints the untruncated per-event listing of an
+existing .gz/.zlib/.def/.png stream (or one --zip-entry of a .zip/.jar/.apk)
+with every literal byte in full hex — parser-only, so no library or system
+zlib is touched (its --help warns the listing can be much larger than the file).
+
 Examples:
   zanalyze.py analyze --lib build-develop/libz-ng.so file.bin
   zanalyze.py analyze --lib build-develop/libz-ng.so file.bin --level 3 --events
@@ -41,6 +46,8 @@ Examples:
   zanalyze.py analyze-file file.gz --window-bits 15
   zanalyze.py analyze-file image.png
   zanalyze.py analyze-file archive.zip
+  zanalyze.py dump-file file.gz --max-events 200
+  zanalyze.py dump-file archive.zip --zip-entry 2
   zanalyze.py diff --lib build-develop/libz-ng.so,build-pr/libz-ng.so file.bin
   zanalyze.py diff --lib build-develop/libz-ng.so file.bin --window-bits 15,12
   zanalyze.py diff --lib build-develop/libz-ng.so,build-pr/libz-ng.so file.bin --sweep
@@ -57,7 +64,7 @@ import sys
 import time
 from collections import Counter
 
-__version__ = "1.10"
+__version__ = "1.20"
 
 Z_OK = 0
 Z_STREAM_END = 1
@@ -531,8 +538,12 @@ class _Decoder:
             br.pushback(L - k)
         return packed >> 16
 
-    def block(self, src, events, out):
-        """Decode one fixed/dynamic block. out is a bytearray extended in place."""
+    def block(self, limit, events, out):
+        """Decode one fixed/dynamic block. out is a bytearray extended in place.
+
+        ``limit`` bounds how many symbols the block may emit (the decode output
+        length plus one when a source is available, otherwise the bits left in
+        the stream — each symbol costs at least one bit)."""
         br = self.br
         lit_tables = self.lit_tables
         dist_tables = self.dist_tables
@@ -545,7 +556,6 @@ class _Decoder:
         next_report = 0x10000
         # each symbol emits >= 1 output byte, so a valid stream can never
         # contain more symbols than output bytes
-        limit = len(src) + 1
         for _ in range(limit):
             sym = self.symbol(lit_tables)
             if lit_freq is not None:
@@ -566,7 +576,7 @@ class _Decoder:
             if on_progress is not None and len(out) >= next_report:
                 on_progress(len(out))
                 next_report += 0x10000
-        raise DeflateError("block has more symbols than input bytes")
+        raise DeflateError("block has too many symbols")
 
 
 def _append_lit(events):
@@ -594,17 +604,22 @@ def _append_match(out, events, length, dist):
     events.append(["M", length, dist])
 
 
-def parse_deflate(data, src, verify=True, on_progress=None):
+def parse_deflate(data, src=None, verify=True, on_progress=None, return_out=False):
     """Parse a raw deflate stream.
-    Returns (blocks, events, block_trees).
+    Returns (blocks, events, block_trees) — or, when ``return_out`` is true, a
+    fourth element: the full decoded byte buffer the parser reconstructs as it
+    decodes (valid even when ``src`` is None).
     blocks: list of "stored"|"fixed"|"dynamic"
-    events: list of ["L", count] or ["M", length, dist], partitioning src.
+    events: list of ["L", count] or ["M", length, dist], partitioning the output.
     block_trees: one record per block; stored -> {"type","bytes"},
         fixed/dynamic -> {"type","lit_len","dist_len","lit_freq","dist_freq"}.
         Every record also carries "ev_start"/"ev_end", the half-open span of
         event indices the block covers, so a match's code lengths come from its
         own block's tree.
-    If verify, the stream is replayed and must reproduce src exactly.
+    If ``src`` is given and ``verify``, the stream is replayed and must
+    reproduce ``src`` exactly (a source of truth only needed for that check and
+    for the per-block symbol-count bound; when ``src`` is None the bound comes
+    from the bits remaining in the stream instead).
     If on_progress, it is called with the running decoded byte count (roughly
     every 64 KiB) so a caller can drive a progress bar.
     """
@@ -613,6 +628,10 @@ def parse_deflate(data, src, verify=True, on_progress=None):
     events = []
     trees = []
     out = bytearray()
+    # Symbol-count bound per block: with a source it is the decoded length + 1
+    # (one byte per symbol); without one, the bits left in the stream (each
+    # symbol still costs >= 1 bit). Either is a safe over-estimate.
+    sym_limit = (len(src) if src is not None else br.nbits) + 1
     bfinal = 0
     while not bfinal:
         bfinal = br.read(1)
@@ -629,10 +648,9 @@ def parse_deflate(data, src, verify=True, on_progress=None):
             if len(chunk) != length:
                 raise DeflateError("stored block extends past end of stream")
             br.pos += length * 8
-            if verify:
-                out += chunk
-                if on_progress is not None:
-                    on_progress(len(out))
+            out += chunk
+            if on_progress is not None:
+                on_progress(len(out))
             events.append(["L", length])
             blocks.append("stored")
             trees.append({"type": "stored", "bytes": length,
@@ -646,7 +664,7 @@ def parse_deflate(data, src, verify=True, on_progress=None):
                            lit_freq=[0] * len(lit_len),
                            dist_freq=[0] * len(dist_len),
                            on_progress=on_progress)
-            dec.block(src, events, out)
+            dec.block(sym_limit, events, out)
             trees.append({"type": "fixed", "lit_len": lit_len,
                           "dist_len": dist_len, "lit_freq": dec.lit_freq,
                           "dist_freq": dec.dist_freq,
@@ -688,7 +706,7 @@ def parse_deflate(data, src, verify=True, on_progress=None):
                            lit_freq=[0] * len(lit_len),
                            dist_freq=[0] * len(dist_len),
                            on_progress=on_progress)
-            dec.block(src, events, out)
+            dec.block(sym_limit, events, out)
             trees.append({"type": "dynamic", "lit_len": lit_len,
                           "dist_len": dist_len, "lit_freq": dec.lit_freq,
                           "dist_freq": dec.dist_freq,
@@ -697,12 +715,14 @@ def parse_deflate(data, src, verify=True, on_progress=None):
             raise DeflateError(f"bad block type {btype}")
     if br.pos > br.nbits or br.nbits - br.pos > 7:
         raise DeflateError("trailing data after final block")
-    if verify:
+    if verify and src is not None:
         if len(out) != len(src):
             raise DeflateError(f"stream reconstructs {len(out)} bytes, "
                                f"input is {len(src)}")
         if out != src:
             raise DeflateError("stream does not reconstruct the input data")
+    if return_out:
+        return blocks, events, trees, bytes(out)
     return blocks, events, trees
 
 
@@ -1009,13 +1029,16 @@ def print_zip_header(name, file_size, entries):
 def print_zip_summary(agg, n_entries, wbits):
     """Print the aggregate deflate summary for all deflate entries (read as one
     stream): sizes, block/match/literal counts, and match length/distance
-    ranges, aligned like the single-stream summary."""
-    print(f"=== aggregate deflate ({n_entries} entries) ===")
+    ranges, aligned like the single-stream summary. ``n_entries`` sizes the
+    heading's parenthetical (plural-safe)."""
+    suffix = "1 entry" if n_entries == 1 else f"{n_entries} entries"
+    print(f"=== aggregate deflate ({suffix}) ===")
     ratio = agg["comp_size"] / agg["src_size"] if agg["src_size"] else 0.0
     rows = []
     rows.append(("input",
                  (f"{agg['src_size']} bytes "
-                  f"(across {n_entries} deflate entries)")))
+                  f"(across {n_entries} deflate "
+                  f"{'entry' if n_entries == 1 else 'entries'})")))
     rows.append(("compressed", f"{agg['comp_size']} bytes (ratio={ratio:.4f})"))
     block_summary = ", ".join(f"{btype}={count}"
                               for btype, count in sorted(agg["block_counts"].items()))
@@ -1092,24 +1115,52 @@ class _AggregateAnalysis:
         self.events = events
 
 
+def _zip_focus_entries(entries, deflate_entries, zip_entry, name):
+    """Restrict the deflate-entry list to --zip-entry N, or return it unchanged.
+
+    ``zip_entry`` of None means "all deflate entries". A named entry that is
+    out of range or not deflate raises SystemExit (the analyze-file and
+    dump-file paths share these messages)."""
+    if zip_entry is None:
+        return deflate_entries
+    if zip_entry < 0 or zip_entry >= len(entries):
+        raise SystemExit(f"error: {name}: --zip-entry {zip_entry} out of range "
+                         f"(have {len(entries)} entries)")
+    entry = entries[zip_entry]
+    if entry["method"] != ZIP_METHOD_DEFLATE:
+        raise SystemExit(f"error: {name}: entry {zip_entry} "
+                         f"'{entry['name']}' is not deflate "
+                         f"(method {entry['method']}) — only deflate entries "
+                         "have an analyzed stream")
+    return [(zip_entry, entry)]
+
+
 def analyze_zip_file(args, comp, name, zlib):
     """'analyze-file' on a ZIP/JAR/APK: show the archive header, analyze the
     deflate entries (aggregated as one stream, cross-checked against system
-    zlib), and list basic stats for every entry (stored/other not analyzed)."""
+    zlib), and list basic stats for every entry (stored/other not analyzed).
+    With ``args.zip_entry`` set, only that single deflate entry is fed into the
+    one-stream report (focusing hists/map/economics/huffman on it)."""
     try:
         entries = parse_zip(comp)
     except DeflateError as e:
         raise SystemExit(f"error: {args.file}: {e}") from e
     if args.json:
         _dump(_zip_json(name, comp, entries, args.window_bits, zlib,
-                        args.json_full))
+                        args.json_full, args.zip_entry))
         return
-    print_zip_header(name, len(comp), entries)
-    print()
     wbits = args.window_bits
     options = (None, wbits, None, None)
     deflate_entries = [(idx, entry) for idx, entry in enumerate(entries)
                        if entry["method"] == ZIP_METHOD_DEFLATE]
+    deflate_entries = _zip_focus_entries(entries, deflate_entries,
+                                         args.zip_entry, name)
+    print_zip_header(name, len(comp), entries)
+    print()
+    if args.zip_entry is not None:
+        print(f"  focus: --zip-entry {args.zip_entry} "
+              f"({entries[args.zip_entry]['name']}, deflate)")
+        print()
     if not deflate_entries:
         print_zip_entries(entries, {})
         print()
@@ -1151,11 +1202,15 @@ def analyze_zip_file(args, comp, name, zlib):
     progress.finish()
     agg = aggregate_analyses(analyses, wbits)
     print_zip_summary(agg, len(analyses), wbits)
-    print(f"system zlib inflate: ok ({len(analyses)} deflate entries "
-          f"cross-checked)")
+    n = len(analyses)
+    print(f"system zlib inflate: ok ({n} deflate "
+          f"{'entry' if n == 1 else 'entries'} cross-checked)")
     print()
     print_zip_entries(entries, deflate_analyses)
     print()
+    if args.events and args.zip_entry is not None:
+        print_events(analyses[0], args.max_events, args.show_bytes)
+        print()
     print_length_hist(agg["len_hist"], agg["n_match"], args.length_full)
     print()
     print_dist_hist(agg["dist_hist"], agg["n_match"], args.dist_log2)
@@ -1593,14 +1648,19 @@ def _region_effect(events_a, events_b, start, end) \
     return (end - start), side(events_a), side(events_b)
 
 
-def fmt_event(ev, off, src=None, show_bytes=False):
-    """Render one event for display; optionally include the literal byte hex."""
+def fmt_event(ev, off, src=None, show_bytes=False, hex_cap=16):
+    """Render one event for display; optionally include the literal byte hex.
+
+    ``hex_cap`` limits how many hex bytes are shown (``None`` = show them all);
+    it only applies when ``show_bytes`` is set."""
     if ev[0] == "L":
         text = f"L x{ev[1]}"
         if show_bytes and src is not None:
             chunk = src[off:off + ev[1]]
-            hexs = " ".join(f"{byte:02x}" for byte in chunk[:16])
-            if len(chunk) > 16:
+            if hex_cap is None or len(chunk) <= hex_cap:
+                hexs = " ".join(f"{byte:02x}" for byte in chunk)
+            else:
+                hexs = " ".join(f"{byte:02x}" for byte in chunk[:hex_cap])
                 hexs += " ..."
             text += f" [{hexs}]"
     else:
@@ -2180,10 +2240,11 @@ def print_summary(analysis, title):
               f"window size {window} allowed by window_bits={wbits}")
 
 
-def print_events(analysis, max_events, show_bytes):
-    """Print the per-event listing, capped to ``max_events`` when > 0."""
-    events = analysis.events
-    src = analysis.src
+def print_event_list(events, out, max_events, show_bytes=False, hex_cap=16):
+    """Print a per-event listing (header, position-tagged rows, cap notice) of
+    ``events`` decoded from ``out``. ``max_events`` of 0 means no cap; literal
+    byte hex is shown when ``show_bytes`` with ``hex_cap`` bounding how many
+    bytes (``None`` = all)."""
     if not max_events or len(events) <= max_events:
         show = events
         more = 0
@@ -2193,10 +2254,16 @@ def print_events(analysis, max_events, show_bytes):
     print(f"=== events ({len(events)} total) ===")
     off = 0
     for ev in show:
-        print(f"  {off:010d}  {fmt_event(ev, off, src, show_bytes)}")
+        print(f"  {off:010d}  {fmt_event(ev, off, out, show_bytes, hex_cap)}")
         off += ev[1]
     if more:
         print(f"  ... {more} more events (use --max-events to raise the cap)")
+
+
+def print_events(analysis, max_events, show_bytes, hex_cap=16):
+    """Print the per-event listing of an Analysis, capped to ``max_events`` > 0."""
+    print_event_list(analysis.events, analysis.src, max_events, show_bytes,
+                     hex_cap)
 
 
 def _eff_rows(litlen, dist):
@@ -2640,6 +2707,9 @@ def cmd_analyze_file(args, comp):
     if comp.startswith(ZIP_LOCAL_MAGIC):
         analyze_zip_file(args, comp, name, zlib)
         return
+    if args.zip_entry is not None:
+        raise SystemExit("error: --zip-entry only applies to "
+                         ".zip/.jar/.apk files")
     detected = detect_wrapper(comp)
     _deflate, wrapper, _trailer = detected
     wbits = {"zlib": 15, "gzip": 31, "raw": -15}[wrapper]
@@ -2689,6 +2759,77 @@ def cmd_analyze_file(args, comp):
                           resolve_map_color(args))
     print()
     print_huffman(analysis, args.huff_symbols)
+
+
+def cmd_dump_file(args, comp):
+    """'dump-file': the parser-only full event listing of an existing
+    .gz/.zlib/.def stream, a .png's IDAT deflate stream, or (with --zip-entry)
+    one deflate entry of a .zip/.jar/.apk. Unlike analyze-file this mode never
+    touches system zlib — the parser reconstructs the source itself."""
+    name = os.path.basename(args.file)
+    if comp.startswith(PNG_SIGNATURE):
+        try:
+            _, idat, _ = parse_png(comp)
+        except DeflateError as e:
+            raise SystemExit(f"error: {args.file}: {e}") from e
+        comp = idat
+    if comp.startswith(ZIP_LOCAL_MAGIC):
+        dump_zip(args, comp, name)
+        return
+    try:
+        deflate, detected, _ = detect_wrapper(comp)
+    except DeflateError as e:
+        raise SystemExit(f"error: {args.file}: {e}") from e
+    print(f"=== dump-file: {name} ({len(comp)} bytes) ===")
+    print(f"  format: {detected}")
+    try:
+        blocks, events, _, out = parse_deflate(deflate, None, return_out=True)
+    except DeflateError as e:
+        raise SystemExit(f"error: {args.file}: {e}") from e
+    print(f"  blocks: {len(blocks)} | decoded {len(out)} bytes")
+    print()
+    print_event_list(events, out, args.max_events, show_bytes=True, hex_cap=None)
+
+
+def dump_zip(args, comp, name):
+    """'dump-file' on a zip container: with --zip-entry N, dump that entry's
+    raw deflate stream (parser-only); without it, list the entries and exit
+    non-zero, since the single-stream dump needs an entry selection."""
+    entries = parse_zip(comp)
+    if args.zip_entry is None:
+        print_zip_header(name, len(comp), entries)
+        n_deflate = sum(1 for e in entries if e["method"] == ZIP_METHOD_DEFLATE)
+        n_stored = sum(1 for e in entries if e["method"] == 0)
+        n_other = len(entries) - n_deflate - n_stored
+        raise SystemExit(
+            "error: use --zip-entry N to dump one entry's deflate stream "
+            f"({n_deflate} deflate, {n_stored} stored, {n_other} other):\n"
+            + "\n".join(f"  {i}: {e['name']} (method {e['method']})"
+                        for i, e in enumerate(entries))
+            + "\n(re-run with each --zip-entry N to dump all deflate entries)")
+    n = args.zip_entry
+    if n < 0 or n >= len(entries):
+        raise SystemExit(f"error: {name}: --zip-entry {n} out of range "
+                         f"(have {len(entries)} entries)")
+    entry = entries[n]
+    if entry["method"] != ZIP_METHOD_DEFLATE:
+        raise SystemExit(f"error: {name}: entry {n} "
+                         f"'{entry['name']}' is not deflate "
+                         f"(method {entry['method']}) — only deflate entries "
+                         "have a stream to dump")
+    rawoff = entry["data_offset"]
+    try:
+        _, events, _, out = parse_deflate(comp[rawoff:rawoff + entry["csize"]],
+                                          None, return_out=True)
+    except DeflateError as e:
+        raise SystemExit(f"error: {name}: entry {n} ('{entry['name']}'): "
+                         f"{e}") from e
+    print(f"=== dump-file: {name} :: {entry['name']} (entry {n}, "
+          f"{entry['csize']} compressed) ===")
+    print(f"  method: deflate | compressed {entry['csize']} -> "
+          f"decoded {len(out)} bytes (uncompressed size {entry['usize']})")
+    print()
+    print_event_list(events, out, args.max_events, show_bytes=True, hex_cap=None)
 
 
 # ---------------------------------------------------------------------------
@@ -2982,11 +3123,15 @@ def _zip_entries_json(entries):
     } for entry in entries]
 
 
-def _zip_json(name, comp, entries, wbits, zlib, full):
-    """Build the JSON document for an analyzed .zip/.jar/.apk (aggregated)."""
+def _zip_json(name, comp, entries, wbits, zlib, full, zip_entry=None):
+    """Build the JSON document for an analyzed .zip/.jar/.apk (aggregated).
+    ``zip_entry`` (from --zip-entry) focuses the aggregate on a single deflate
+    entry and is recorded in the document."""
     options = (None, wbits, None, None)
     deflate_entries = [(idx, entry) for idx, entry in enumerate(entries)
                        if entry["method"] == ZIP_METHOD_DEFLATE]
+    deflate_entries = _zip_focus_entries(entries, deflate_entries,
+                                         zip_entry, name)
     analyses = []
     for _idx, entry in deflate_entries:
         raw = comp[entry["data_offset"]:entry["data_offset"] + entry["csize"]]
@@ -3018,7 +3163,9 @@ def _zip_json(name, comp, entries, wbits, zlib, full):
         "comp_size": len(comp),
         "src_size": agg["src_size"],
         "n_entries": len(entries),
-        "n_deflate": len(analyses),
+        "n_deflate": sum(1 for entry in entries
+                         if entry["method"] == ZIP_METHOD_DEFLATE),
+        "zip_entry": zip_entry,
         "window_bits": wbits,
         "entries": _zip_entries_json(entries),
         "aggregate": _jsonable(_trim_stats(agg, full)),
@@ -3393,7 +3540,14 @@ def main():
                                      "for external files)")
     p_analyze_file.add_argument("--events", action="store_true",
                                 help="show the per-event listing (off by default; "
-                                     "not shown for aggregated .zip/.jar/.apk)")
+                                     "not shown for aggregated .zip/.jar/.apk; "
+                                     "shown for the entry selected by "
+                                     "--zip-entry)")
+    p_analyze_file.add_argument("--zip-entry", type=int, default=None,
+                                metavar="N",
+                                help="analyze only deflate entry N of a "
+                                     ".zip/.jar/.apk (default: aggregate all "
+                                     "deflate entries; errors on other files)")
     p_analyze_file.add_argument("--max-events", type=int, default=0,
                                 help="cap the per-event listing (0 = all)")
     p_analyze_file.add_argument("--show-bytes", action="store_true",
@@ -3422,6 +3576,25 @@ def main():
                                 help="with --json, do not cap the match "
                                      f"histograms or cost map to the top "
                                      f"{_JSON_HIST_TOP} entries")
+
+    p_dump_file = sub.add_parser(
+        "dump-file",
+        help="list every event of an existing .gz/.zlib/.def/.png stream or "
+             "one .zip/.jar/.apk deflate entry (output can be many times "
+             "larger than the file)",
+        epilog="WARNING: the per-event listing can be many times larger than "
+               "the compressed file itself — every literal run is dumped in "
+               "full. Cap it with --max-events. For a .zip/.jar/.apk, a "
+               "--zip-entry N must be given to pick one deflate entry (the "
+               "plain command prints the entry list and exits non-zero).")
+    p_dump_file.add_argument("file", help="compressed file to dump")
+    p_dump_file.add_argument("--max-events", type=int, default=0,
+                             help="cap the per-event listing (0 = all)")
+    p_dump_file.add_argument("--zip-entry", type=int, default=None,
+                             help="zip containers: dump only this entry "
+                                  "index (0-based) instead of exiting with "
+                                  "the entry list")
+    add_pypy_opt(p_dump_file)
 
     p_diff = sub.add_parser("diff", help="diff two libraries' streams")
     p_diff.add_argument("--lib", required=True,
@@ -3458,12 +3631,15 @@ def main():
         args.levels = parse_levels(args.levels)
     args.verify = not getattr(args, "no_verify", False)
 
-    if args.cmd == "analyze-file":
+    if args.cmd in ("analyze-file", "dump-file"):
         with open(args.file, "rb") as fh:
             comp = fh.read()
         if not comp:
             raise SystemExit(f"error: {args.file} is empty")
-        cmd_analyze_file(args, comp)
+        if args.cmd == "analyze-file":
+            cmd_analyze_file(args, comp)
+        else:
+            cmd_dump_file(args, comp)
         return
 
     with open(args.file, "rb") as fh:

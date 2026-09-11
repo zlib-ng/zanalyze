@@ -2,6 +2,32 @@
 
 All notable changes to `zanalyze.py` are documented in this file.
 
+## [1.20] - 2026-09-12
+
+### Added
+
+- New `dump-file` mode: prints the complete per-event listing of an existing
+  compressed file (every literal run and match, with its start position and
+  each literal byte shown in full hex). It is the only mode that never touches
+  system zlib — the internal parser reconstructs the source itself. Because
+  the output is many times larger than the input (see `--help`), literal runs
+  are dumped in full; `--max-events` caps the listing. For a
+  `.zip`/`.jar`/`.apk` the command exits non-zero and lists the entries until
+  `--zip-entry N` selects a deflate entry to dump.
+- `analyze-file` gains an optional `--zip-entry N`: analyze only that single
+  deflate entry of a `.zip`/`.jar`/`.apk` instead of the whole-archive
+  aggregate. The report keeps the zip header and the full per-entry table for
+  context but reads as a one-entry stream (summary labelled `(1 entry)`,
+  histograms/map/economics/Huffman from that entry only, and `--events`
+  honored for it). A non-deflate or out-of-range entry exits non-zero; on a
+  non-zip file the flag is an error.
+- CI now runs the test suite under PyPy 3.11 as well as CPython 3.12.
+
+### Fixed
+
+- The test suite's `FAILURES` collector is now annotated (`list[str]`), keeping
+  current mypy clean on CI.
+
 ## [1.10] - 2026-09-12
 
 ### Added

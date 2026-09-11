@@ -1,7 +1,8 @@
 # deflate-analyze Agent Guide
 
 `zanalyze.py` is a single-file, **stdlib-only** Python CLI tool (needs 3.10+;
-`zip(strict=)` is the only version-sensitive feature; CI runs on 3.12) that
+`zip(strict=)` is the only version-sensitive feature; CI runs the suite on
+3.12 and PyPy 3.11) that
 compresses a file with a supplied zlib(-ng) shared library and analyzes the
 resulting deflate stream: every match (length + distance), the literal runs
 before each match, a summary, match-length/distance histograms, and a
@@ -11,13 +12,15 @@ and show only the divergent regions of the decision streams side-by-side. It can
 further analyze an existing compressed file (`.gz`/`.zlib`/`.def`, a `.png`'s
 IDAT deflate stream, reporting the image header, or a `.zip`/`.jar`/`.apk`'s
 deflate entries, aggregated across entries with a per-entry stats table) by
-recovering the source with system zlib.
+recovering the source with system zlib, and can instead `dump-file` it:
+the untruncated per-event listing (every literal byte in full hex) of an
+existing stream, parser-only — no library and no system zlib involved.
 
 ## Files
 
 - `zanalyze.py` — the tool (ctypes binding + deflate parser + reporters + CLI).
 - `test_zanalyze.py` — the test suite (parser, wrapper, divergence, metrics, CLI).
-- `CHANGELOG.md` — version history (currently 1.10 PyPy, 1.00 "Initial release").
+- `CHANGELOG.md` — version history (currently 1.20, 1.10 PyPy, 1.00 "Initial release").
 - `pyproject.toml` — all linter/checker config: ruff (`[tool.ruff.lint]`),
   mypy (`[tool.mypy]`), and pylint (`[tool.pylint.*]`).
 - `.github/workflows/ci.yml` — CI: linters/type check, plus tests (builds zlib-ng).
@@ -51,6 +54,15 @@ python3 zanalyze.py analyze-file file.gz --window-bits 15
 python3 zanalyze.py analyze-file image.png
 # analyze a ZIP/JAR/APK's deflate entries (aggregated; per-entry table shown)
 python3 zanalyze.py analyze-file archive.zip --window-bits 15
+# focus the whole report on one deflate entry (optional --zip-entry)
+python3 zanalyze.py analyze-file archive.zip --zip-entry 2 --window-bits 15
+
+# dump an existing stream's full per-event listing (parser-only, no library,
+# no system zlib — the source is reconstructed by the internal parser); the
+# literal runs are shown in full hex; cap with --max-events
+python3 zanalyze.py dump-file file.gz --max-events 200
+# zip containers need --zip-entry N (plain run lists entries, exits non-zero)
+python3 zanalyze.py dump-file archive.zip --zip-entry 2
 
 # diff two libraries (comma form; or per-side options, e.g. different windowBits)
 python3 zanalyze.py diff --lib build-develop/libz-ng.so,build-pr/libz-ng.so file.bin
@@ -136,7 +148,11 @@ pylint zanalyze.py test_zanalyze.py       # must be 10/10 (see pyproject.toml)
   `_efficiency`/`_bit_budget` so the summary, histograms, and Huffman/bit-budget
   report read as one stream. Stored/other entries get basic stats only (no
   analysis); `print_zip_header`/`print_zip_summary`/`print_zip_entries` render the
-  file header, the aggregate summary, and a one-line-per-entry table.
+  file header, the aggregate summary, and a one-line-per-entry table. An optional
+  `--zip-entry N` focuses on one entry: `_zip_focus_entries` (shared by the
+  human and `_zip_json` paths) validates N against the entries and restricts the
+  deflate list to it, the summary reads `(1 entry)`, `--events` is honored for
+  that entry, and on any other file the flag errors.
 - **Metrics** — `_tree_bits`, `_efficiency` (actual vs entropy bits per tree),
   `_bit_budget` (splits the stream's bits: lit/len, len-extra, dist, dist-extra,
   stored, header), `_match_costs` (per-match bit cost vs the all-literal
@@ -171,7 +187,8 @@ pylint zanalyze.py test_zanalyze.py       # must be 10/10 (see pyproject.toml)
     dicts JSON-safe, turning Counters and non-string keys into dashed/string
     strings), then per-mode document builders `_analysis_json` (analyze/
     analyze-file, with `_png_json` for the PNG header and `_zip_json` for the
-    aggregated archive), `_diff_json` (both sides + metrics + regions), and
+    aggregated archive (recording a focused `--zip-entry` N in `zip_entry`),
+    `_diff_json` (both sides + metrics + regions), and
     `_sweep_doc` (per-level rows). Before building, `_trim_stats`/`_trim_economics`
     cap the large match histograms (`len_hist`/`dist_hist`/`pair_hist`) and the
     cost map to the top `_JSON_HIST_TOP` (50) entries and record a `_truncated`
@@ -187,10 +204,19 @@ pylint zanalyze.py test_zanalyze.py       # must be 10/10 (see pyproject.toml)
     `pypy3` found on PATH, unless already on PyPy, `ZANALYZE_NO_PYPY` is set,
     a `--no-pypy` flag appears in argv, or the `ZANALYZE_ALREADY_PYPY` re-entry
     guard is present; `add_pypy_opt` registers the flag on the top parser and
-    all three subparsers). `cmd_analyze`/
+    all four subparsers). `cmd_analyze`/
     `cmd_analyze_file`/`analyze_zip_file` and the
     `diff` path build a `Progress` (stderr, TTY-gated) and thread its `update`
     into `Analysis` → `parse_deflate` → `_Decoder` (per-side `A`/`B` bars in diff).
+    `cmd_dump_file`/`dump_zip` (the `dump-file` mode) print the untruncated
+    per-event listing (`print_event_list`, literal runs always in full hex via
+    `fmt_event(..., show_bytes=True, hex_cap=None)`) of an existing stream's
+    deflate data (PNG IDAT, or one `--zip-entry` of a zip), parsing with the
+    internal parser alone — `parse_deflate(data, None, return_out=True)`, whose
+    optional `src=None` disables verification and bounds the per-block symbol
+    count by the stream's remaining bits instead. It has no progress bar (the
+    decoded total is unknowable without zlib) and its `--help` warns the output
+    is many times larger than the file.
 
 ## Conventions
 
@@ -206,7 +232,8 @@ pylint zanalyze.py test_zanalyze.py       # must be 10/10 (see pyproject.toml)
   made with windowBits 8 may legitimately hold distances up to 512.
 - **System `zlib`** is used **only** in `analyze-file` mode (lazy import) to
   recover the source and cross-check the internal parser. In `diff`, `--lib` is
-  required (no system-zlib fallback).
+  required (no system-zlib fallback); in `dump-file`, `--lib` is not accepted
+  and no library or system zlib is touched at all.
 - **PNG** (`analyze-file` only): a file starting with the 8-byte PNG signature
   has its IDAT chunk(s) concatenated into one zlib stream and analyzed like any
   other zlib stream; the IHDR (width, height, bit depth, color type, interlace)
@@ -378,7 +405,7 @@ Current frames: `analyze-map.png` 980x3544, `diff-maps.png` 1100x2838,
   release time. This excludes fixes to problems introduced during this same
   version's development (those are judged by the version they compare against,
   i.e. what a 1.xx user upgrading to the next release would notice).
-- Version scheme: `A.B` with a two-digit minor (e.g. 1.00 → 1.10); a `- <date>`
+- Version scheme: `A.B` with a two-digit minor (e.g. 1.10 → 1.20); a `- <date>`
   ISO-dated entry per version.
 
 ## License

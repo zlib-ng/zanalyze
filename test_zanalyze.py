@@ -44,7 +44,7 @@ DATA = os.environ.get(
     "ZANALYZE_TEST_DATA",
     "/home/opencode/opencode/zlib-ng/test/data/lcet10.txt")
 
-FAILURES = []
+FAILURES: list[str] = []
 
 
 def check(name, cond, extra=""):
@@ -651,7 +651,7 @@ def test_zip_progress():
         file=os.path.basename(path), json=False, window_bits=15, progress=True,
         length_full=False, dist_log2=False, map_axis_linear=False,
         map_scale_log2=False, map_colors=None, huff_symbols=False,
-        events=False, max_events=0,
+        events=False, max_events=0, zip_entry=None,
         show_bytes=False, json_full=False)
     with open(path, "rb") as fh:
         comp = fh.read()
@@ -1196,6 +1196,129 @@ def test_region_effect():
     check("region b split", (sb[0], sb[1], sb[2]) == (1, 9, 0), str(sb))
 
 
+def test_parse_deflate_return_out():
+    """parse_deflate with src=None (no verify) still reconstructs the bytes."""
+    print("parse_deflate return_out")
+    src = bytes(range(256)) * 8 + b"recurring recurring recurring data "
+    for label, wb in (("zlib", 15), ("gzip", 31), ("raw", -15)):
+        co = zlib.compressobj(6, zlib.DEFLATED, wb)
+        comp = co.compress(src) + co.flush()
+        d, _w, _t = z.split_wrapper(comp, wb)
+        res = z.parse_deflate(d, None, return_out=True)
+        check(f"{label} 4-tuple", isinstance(res, tuple) and len(res) == 4)
+        blocks, _ev, _tre, out = res
+        check(f"{label} out == src", out == src,
+              f"{len(out)} vs {len(src)}")
+        check(f"{label} rebuilt blocks", len(blocks) >= 1)
+    # a stored-only (level 0) raw stream: the parser must still fill out
+    co = zlib.compressobj(0, zlib.DEFLATED, -15)
+    cc = co.compress(src) + co.flush()
+    _b, _e, _t, out = z.parse_deflate(cc, None, return_out=True)
+    check("stored out == src", out == src, f"{len(out)} vs {len(src)}")
+
+
+def test_dump_file():
+    """CLI dump-file mode: parser-only full event listing for every wrapper,
+    plus the zip-container entry-selection behavior."""
+    import gzip
+    import tempfile
+    print("cli dump-file")
+    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zanalyze.py")
+    src = b"hello world " * 40  # 480 bytes, enough for several matches
+    tmp = tempfile.mkdtemp()
+
+    def run(args):
+        return subprocess.run([sys.executable, tool] + args,
+                              capture_output=True, text=True, check=False)
+
+    def coverage(stdout):
+        """Reconstruct the event tiles from the listing: return (max_pos, ok)."""
+        pos = 0
+        for line in stdout.splitlines():
+            m = re.match(r"^ {2}(\d{10})  (L x(\d+)(?: \[[0-9a-f ].*?\])?|M len=(\d+) dist=\d+)\s*$", line)
+            if not m:
+                continue
+            start = int(m.group(1))
+            size = int(m.group(3) or m.group(4))
+            if start != pos:
+                return pos, False
+            pos += size
+        return pos, True
+
+    zbf = os.path.join(tmp, "dump.zlib")
+    with open(zbf, "wb") as fh:
+        fh.write(zlib.compress(src, 6))
+    gf = os.path.join(tmp, "dump.gz")
+    with open(gf, "wb") as fh:
+        fh.write(gzip.compress(src, compresslevel=6))
+    co = zlib.compressobj(9, zlib.DEFLATED, -15)
+    df = os.path.join(tmp, "dump.def")
+    with open(df, "wb") as fh:
+        fh.write(co.compress(src) + co.flush())
+    pnf = os.path.join(tmp, "dump.png")
+    with open(pnf, "wb") as fh:
+        fh.write(_make_png(8, 8, zlib.compress(b"\x00" * 65)))
+    zipf = os.path.join(tmp, "dump.zip")
+    with open(zipf, "wb") as fh:
+        fh.write(_make_zip([("one.txt", b"hello world " * 40, z.ZIP_METHOD_DEFLATE),
+                            ("two.bin", b"\x00" * 64, z.ZIP_METHOD_STORED)]))
+    badf = os.path.join(tmp, "broken.def")
+    with open(badf, "wb") as fh:
+        fh.write(b"\x03\x00\x00\x00\x00\x00\x00\x00")
+    # single-stream wrappers
+    png_decoded = 65  # the IDAT below compresses exactly 65 raw bytes
+    for path, fmt, want in ((zbf, "zlib", len(src)), (gf, "gzip", len(src)),
+                            (df, "raw", len(src)), (pnf, "zlib", png_decoded)):
+        r = run(["dump-file", path])
+        check(f"dump {os.path.basename(path)} exit 0",
+              r.returncode == 0, r.stderr[-300:])
+        check(f"dump {os.path.basename(path)} header",
+              "=== dump-file:" in r.stdout and f"format: {fmt}" in r.stdout,
+              r.stdout[:200])
+        check(f"dump {os.path.basename(path)} events",
+              "=== events (" in r.stdout)
+        check(f"dump {os.path.basename(path)} tiles",
+              coverage(r.stdout) == (want, True), f"wanted {want}")
+    r = run(["dump-file", zbf])
+    check("dump literals full hex", "L x" in r.stdout
+          and "68 65 6c 6c 6f" in r.stdout)
+    check("dump matches shown", "M len=" in r.stdout)
+    r = run(["dump-file", zbf, "--max-events", "1"])
+    check("dump max-events cap", r.returncode == 0
+          and "more events (use --max-events" in r.stdout)
+    # corrupt raw stream fails cleanly via the parser
+    r = run(["dump-file", badf])
+    check("dump corrupt exits nonzero", r.returncode != 0
+          and "error:" in r.stderr, r.stderr[-300:])
+    # zip: no --zip-entry -> nonzero, header + list of entries
+    r = run(["dump-file", zipf])
+    check("dump zip needs entry", r.returncode != 0
+          and "use --zip-entry N" in r.stderr
+          and "0: one.txt (method 8)" in r.stderr
+          and "1 deflate, 1 stored" in r.stdout, r.stderr[:300])
+    # zip: --zip-entry N -> that entry's deflate stream
+    r = run(["dump-file", zipf, "--zip-entry", "0"])
+    check("dump zip entry exit 0", r.returncode == 0, r.stderr[-300:])
+    check("dump zip entry header", ":: one.txt (entry 0" in r.stdout
+          and "=== events (" in r.stdout)
+    check("dump zip entry size",
+          "compressed" in r.stdout and "uncompressed size 480" in r.stdout)
+    check("dump zip entry tiles",
+          coverage(r.stdout) == (480, True), r.stdout[:200])
+    # zip: stored entry rejected, out-of-range index rejected
+    r = run(["dump-file", zipf, "--zip-entry", "1"])
+    check("dump zip stored rejected", r.returncode != 0
+          and "is not deflate" in r.stderr, r.stderr[:200])
+    r = run(["dump-file", zipf, "--zip-entry", "9"])
+    check("dump zip out of range", r.returncode != 0
+          and "out of range" in r.stderr, r.stderr[:200])
+    # --help carries the size warning
+    h = run(["dump-file", "--help"])
+    check("dump help warning",
+          "many times larger than the compressed" in h.stdout,
+          h.stdout[-500:])
+
+
 def test_cli_smoke():
     """Run the CLI end-to-end (analyze / analyze-file / diff) via subprocess."""
     print("cli smoke (analyze / analyze-file / diff)")
@@ -1258,6 +1381,12 @@ def test_cli_smoke():
                            capture_output=True, text=True, check=False)
         check("analyze-file exit 0", r.returncode == 0, r.stderr[-300:])
         check("analyze-file cross-check", "system zlib inflate: ok" in r.stdout)
+        r = subprocess.run([sys.executable, tool, "analyze-file", gz,
+                            "--zip-entry", "0"], capture_output=True, text=True,
+                           check=False)
+        check("analyze-file zip-entry non-zip error",
+              r.returncode != 0 and "--zip-entry only applies to" in r.stderr,
+              r.stderr[-200:])
     finally:
         os.unlink(gz)
     # analyze-file: a PNG whose IDAT is a zlib stream (image header + deflate)
@@ -1307,6 +1436,46 @@ def test_cli_smoke():
                            check=False)
         check("analyze-file zip no-huff-symbols",
               "symbols by frequency" not in r.stdout)
+        r = subprocess.run([sys.executable, tool, "analyze-file", zipf,
+                            "--zip-entry", "0"], capture_output=True, text=True,
+                           check=False)
+        check("analyze-file zip-entry 0 exit 0",
+              r.returncode == 0, r.stderr[-300:])
+        check("analyze-file zip-entry focus",
+              "focus: --zip-entry 0" in r.stdout)
+        check("analyze-file zip-entry one entry",
+              "=== aggregate deflate (1 entry) ===" in r.stdout)
+        check("analyze-file zip-entry cross-check",
+              "system zlib inflate: ok (1 deflate entry cross-checked)"
+              in r.stdout)
+        check("analyze-file zip-entry kept context",
+              "=== per-entry (2 entries) ===" in r.stdout)
+        r = subprocess.run([sys.executable, tool, "analyze-file", zipf,
+                            "--zip-entry", "0", "--events", "--max-events",
+                            "2"], capture_output=True, text=True, check=False)
+        check("analyze-file zip-entry events honored",
+              r.returncode == 0 and "=== events" in r.stdout, r.stderr[-300:])
+        r = subprocess.run([sys.executable, tool, "analyze-file", zipf,
+                            "--zip-entry", "1"], capture_output=True, text=True,
+                           check=False)
+        check("analyze-file zip-entry stored error",
+              r.returncode != 0 and "is not deflate" in r.stderr,
+              r.stderr[-200:])
+        r = subprocess.run([sys.executable, tool, "analyze-file", zipf,
+                            "--zip-entry", "9"], capture_output=True, text=True,
+                           check=False)
+        check("analyze-file zip-entry out-of-range error",
+              r.returncode != 0 and "out of range" in r.stderr, r.stderr[-200:])
+        r = subprocess.run([sys.executable, tool, "analyze-file", zipf,
+                            "--json", "--zip-entry", "0"],
+                           capture_output=True, text=True, check=False)
+        import json
+        doc = json.loads(r.stdout) if r.returncode == 0 else {}
+        check("analyze-file zip-entry json exit 0",
+              r.returncode == 0, r.stderr[-300:])
+        check("analyze-file zip-entry json field",
+              doc.get("zip_entry") == 0 and doc.get("n_deflate") == 1
+              and len(doc.get("entries", [])) == 2, r.stdout[-300:])
     finally:
         os.unlink(zipf)
     # analyze-file: an all-stored ZIP has no deflate to analyze
@@ -1509,6 +1678,8 @@ def main():
     test_cost_map_diff()
     test_match_economics_render()
     test_region_effect()
+    test_parse_deflate_return_out()
+    test_dump_file()
     test_cli_smoke()
     test_cli_version()
     test_pypy_reexec()
