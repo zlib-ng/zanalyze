@@ -26,6 +26,7 @@ import io
 import itertools
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -154,6 +155,43 @@ def test_progress():
     check("progress bounded", all(0 < c <= len(buf) for c in calls))
     check("progress non-decreasing",
           all(a <= b for a, b in itertools.pairwise(calls)))
+
+
+def test_progress_pypy_tip():
+    """The bar hints at pypy3 only on CPython with none installed on PATH."""
+    print("progress pypy tip")
+    want_tip = (sys.implementation.name != "pypy"
+                and shutil.which("pypy3") is None)
+    fh = _FakeTTY()
+    bar = z.Progress(100, interval=0.0, fh=fh, enabled=True)
+    bar.hint_after = 0.0
+    bar.update(100)
+    check("tip shown iff pypy3 absent",
+          ("pypy3" in fh.getvalue()) == want_tip, fh.getvalue())
+    # threshold: the hint stays hidden until hint_after seconds of decoding
+    fh2 = _FakeTTY()
+    bar2 = z.Progress(100, interval=0.0, fh=fh2, enabled=True)
+    bar2.hint_after = 1e9
+    bar2.update(100)
+    check("hint gated by elapsed", "pypy3" not in fh2.getvalue())
+    # negative: with a pypy3 on PATH the hint never shows (deterministic)
+    import tempfile
+    old_path = os.environ.get("PATH", "")
+    tmp = tempfile.mkdtemp()
+    try:
+        shim = os.path.join(tmp, "pypy3")
+        with open(shim, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(shim, 0o755)
+        os.environ["PATH"] = tmp + os.pathsep + old_path
+        fh3 = _FakeTTY()
+        bar3 = z.Progress(100, interval=0.0, fh=fh3, enabled=True)
+        bar3.hint_after = 0.0
+        bar3.update(100)
+        check("no hint with pypy3 on PATH", "pypy3" not in fh3.getvalue())
+    finally:
+        os.environ["PATH"] = old_path
+        shutil.rmtree(tmp)
 
 
 def test_build_huffman_fixed():
@@ -1378,16 +1416,67 @@ def test_cli_version():
     r = subprocess.run([sys.executable, tool, "--version"],
                        capture_output=True, text=True, check=False)
     check("version flag exit 0", r.returncode == 0, r.stderr[-200:])
-    check("version flag format", "zanalyze.py 1.00" in r.stdout.strip(), r.stdout)
+    check("version flag format",
+          f"zanalyze.py {z.__version__}" in r.stdout.strip(), r.stdout)
     h = subprocess.run([sys.executable, tool, "--help"],
                        capture_output=True, text=True, check=False)
-    check("version in --help", "zanalyze.py 1.00" in h.stdout, h.stdout[-300:])
+    check("version in --help",
+          f"zanalyze.py {z.__version__}" in h.stdout, h.stdout[-300:])
+
+
+def test_pypy_reexec():
+    """Direct launch prefers a pypy3 on PATH; ZANALYZE_NO_PYPY opts out."""
+    import tempfile
+    print("pypy3 re-exec")
+    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zanalyze.py")
+    if sys.implementation.name == "pypy":
+        # already on PyPy: nothing to re-exec into, just confirm it runs
+        r = subprocess.run([sys.executable, tool, "--version"],
+                           capture_output=True, text=True, check=False)
+        check("pypy native run",
+              r.returncode == 0 and z.__version__ in r.stdout, r.stderr[-200:])
+        return
+    with tempfile.TemporaryDirectory() as d:
+        shim = os.path.join(d, "pypy3")
+        marker = os.path.join(d, "pypy3-ran")
+        with open(shim, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n"
+                    f"echo ran >\"{marker}\"\n"
+                    f"exec {sys.executable} \"$@\"\n")
+        os.chmod(shim, 0o755)
+        env = dict(os.environ)
+        env["PATH"] = d + os.pathsep + env.get("PATH", "")
+        # prefer: the fake pypy3 is exec'd and the script still finishes fine
+        r = subprocess.run([sys.executable, tool, "--version"],
+                           capture_output=True, text=True, env=env, check=False)
+        check("prefer pypy3 re-exec",
+              r.returncode == 0 and os.path.exists(marker)
+              and z.__version__ in r.stdout, r.stderr[-200:])
+        # opt-out: no re-exec, marker must not be written
+        if os.path.exists(marker):
+            os.unlink(marker)
+        env["ZANALYZE_NO_PYPY"] = "1"
+        r = subprocess.run([sys.executable, tool, "--version"],
+                           capture_output=True, text=True, env=env, check=False)
+        check("no-pypy opt-out",
+              r.returncode == 0 and not os.path.exists(marker),
+              r.stderr[-200:])
+        # --no-pypy flag vetoes the re-exec even though pypy3 is on PATH
+        if os.path.exists(marker):
+            os.unlink(marker)
+        del env["ZANALYZE_NO_PYPY"]
+        r = subprocess.run([sys.executable, tool, "--no-pypy", "--version"],
+                           capture_output=True, text=True, env=env, check=False)
+        check("no-pypy flag veto",
+              r.returncode == 0 and not os.path.exists(marker),
+              r.stderr[-200:])
 
 
 def main():
     """Run all tests and report pass/fail; return 1 on any failure."""
     test_bitreader()
     test_progress()
+    test_progress_pypy_tip()
     test_build_huffman_fixed()
     test_stored_block()
     test_crafted_match_stream()
@@ -1422,6 +1511,7 @@ def main():
     test_region_effect()
     test_cli_smoke()
     test_cli_version()
+    test_pypy_reexec()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILURES: {FAILURES}")

@@ -17,14 +17,14 @@ recovering the source with system zlib.
 
 - `zanalyze.py` — the tool (ctypes binding + deflate parser + reporters + CLI).
 - `test_zanalyze.py` — the test suite (parser, wrapper, divergence, metrics, CLI).
+- `CHANGELOG.md` — version history (currently 1.10 PyPy, 1.00 "Initial release").
 - `pyproject.toml` — all linter/checker config: ruff (`[tool.ruff.lint]`),
   mypy (`[tool.mypy]`), and pylint (`[tool.pylint.*]`).
 - `.github/workflows/ci.yml` — CI: linters/type check, plus tests (builds zlib-ng).
 - `README.md` — user-facing docs with `freeze`-generated screenshots.
 - `screenshots/` — `analyze-map.png`, `diff-maps.png`, `sweep.png` (colored
-  terminal captures made with `freeze`, `--map-colors-on`; re-generate from
-  repo root's `zanalyze.py` against the zlib-ng builds, see `## Test data /
-  libraries` for the expected library paths).
+  terminal captures made with `freeze`, `--map-colors-on`; regenerate with the
+  exact commands under `## Screenshots (regeneration)`).
 
 ## Commands
 
@@ -183,7 +183,12 @@ pylint zanalyze.py test_zanalyze.py       # must be 10/10 (see pyproject.toml)
     `add_map_opts`/`resolve_map_color` handle the map axis/scale flags and the
     `--map-colors-on/off` overrides (else TTY+TERM auto-detect), and
     `add_progress_opt` adds the `--no-progress` flag (dest `progress`); `main`
-    dispatches. `cmd_analyze`/`cmd_analyze_file`/`analyze_zip_file` and the
+    dispatches (after `_prefer_pypy3`: direct launches re-exec under a
+    `pypy3` found on PATH, unless already on PyPy, `ZANALYZE_NO_PYPY` is set,
+    a `--no-pypy` flag appears in argv, or the `ZANALYZE_ALREADY_PYPY` re-entry
+    guard is present; `add_pypy_opt` registers the flag on the top parser and
+    all three subparsers). `cmd_analyze`/
+    `cmd_analyze_file`/`analyze_zip_file` and the
     `diff` path build a `Progress` (stderr, TTY-gated) and thread its `update`
     into `Analysis` → `parse_deflate` → `_Decoder` (per-side `A`/`B` bars in diff).
 
@@ -289,6 +294,62 @@ pylint zanalyze.py test_zanalyze.py       # must be 10/10 (see pyproject.toml)
      (centered middle row labels, per-side frame + ruler), but is **not** shown in
      `--sweep` (which stays a compact table).
 
+## Screenshots (regeneration)
+
+The three `screenshots/*.png` are colored terminal captures made with
+[`freeze`](https://github.com/charmbracelet/freeze) (charmbracelet; on this
+machine at `/usr/bin/freeze`). Regenerate them whenever the reporters change.
+Run each command below with this repo's bash `workdir` set to
+`/home/opencode/opencode/zlib-ng` (so the visible command text stays short —
+`../deflate-analyze/zanalyze.py`, `build-develop/libz-ng.so`,
+`test/data/lcet10.txt`), with the `-o` output path absolute into the
+`deflate-analyze/screenshots/` dir.
+
+```bash
+# analyze-map.png — match map + match economics + cost map (lcet10, level 6)
+freeze --execute "python3 ../deflate-analyze/zanalyze.py analyze --lib build-develop/libz-ng.so test/data/lcet10.txt --map-colors-on --no-progress 2>/dev/null | sed -n '/=== match distance x length map/,/=== huffman/p'" -o /home/opencode/opencode/deflate-analyze/screenshots/analyze-map.png -W 980
+
+# diff-maps.png — side-by-side match + cost maps, per-side level 1 vs 9
+freeze --execute "python3 ../deflate-analyze/zanalyze.py diff --lib build-develop/libz-ng.so,build-pr/libz-ng.so test/data/lcet10.txt --level 1,9 --map-colors-on --no-progress 2>/dev/null | sed -n '/=== match distance x length map/,/=== huffman/p'" -o /home/opencode/opencode/deflate-analyze/screenshots/diff-maps.png -W 1100
+
+# sweep.png — compact per-level (1-9) table (no colors by design)
+freeze --execute "python3 ../deflate-analyze/zanalyze.py diff --lib build-develop/libz-ng.so,build-pr/libz-ng.so test/data/lcet10.txt --sweep 2>/dev/null" -o /home/opencode/opencode/deflate-analyze/screenshots/sweep.png -W 700
+```
+
+Gotchas, learned the hard way:
+
+- **`-W` is the image width in pixels, not columns.** freeze renders at the
+  terminal's intrinsic cell size and never upscales: a `-W` wider than the
+  content only adds right-hand blank margin, too small a `-W` rescales the text
+  into an unreadable mush *without changing the line count* (heights are
+  width-independent). The tuned values above (analyze 980, diff 1100, sweep
+  700) make the content fill ~93-96% of the width; re-tune only if the layout
+  changes.
+- **Two libraries use the comma form** `--lib A,B` for freeze frames too — the
+  space form makes the second path parse as the input file and die with
+  `unrecognized arguments`.
+- **`sed` crop**: analyze/diff frames crop the report to the
+  `=== match distance x length map` … `=== huffman` range (the two maps plus
+  the match-economics block); sweep needs no crop.
+- **Exit status**: freeze reports `could not execute: exit status 1` and
+  writes nothing if the pipeline exits nonzero — end the pipeline on `sed`
+  (exit 0). Broken/missing `/dev/ptmx` grant renders the same error/empty
+  output (see the nono-sandbox fix).
+- **No `cd`/`&&`/`;` directly in the freeze string**: freeze's own exec
+  handling fails on compound commands; `python3 ... | sed ...` works as-is
+  (wrap in `sh -c '...'` only if a compound is unavoidable). Pipes are fine.
+- **Run each capture as a standalone command, not inside a bash `for` loop** —
+  freeze has been observed to intermittently exit 1 or write nothing in loops.
+- **Logos on errors**: the analyzer writes its decode progress bar to stderr,
+  so `2>/dev/null` keeps the frame clean (plus `--no-progress` where
+  supported); `2>&1` must NOT be used or EOF-broken ANSI leaks in.
+- **Verified** after each capture with PIL: dark-theme background, saturated
+  (colored) pixels present in the two map shots but ~none in sweep, and
+  `rightmost lit x / width` ≥ 0.93 (a model cannot eyeball the images).
+
+Current frames: `analyze-map.png` 980x3544, `diff-maps.png` 1100x2838,
+`sweep.png` 700x352.
+
 ## Test data / libraries
 
 - Libraries: `/home/opencode/opencode/zlib-ng/build-develop/libz-ng.so` and
@@ -301,6 +362,24 @@ pylint zanalyze.py test_zanalyze.py       # must be 10/10 (see pyproject.toml)
   `zip-info.txt` (same dir) documents the ZIP header layout (verified against these).
 - RFC references: `/home/opencode/opencode/rfc1950.txt` (zlib), `rfc1951.txt`
   (deflate), `rfc1952.txt` (gzip), `rfc2083.txt` (PNG).
+
+## Changelog / versioning
+
+- `CHANGELOG.md` is the single source of truth for what changed per version;
+  the version number itself lives in `zanalyze.py` as `__version__` and is
+  shown by `--version` / `--help` (the `test_cli_version` test derives it from
+  `zanalyze.__version__`, so it never hardcodes a number).
+- On release, bump `__version__` to the next version, add a matching
+  `## [x.yz] - <date>` section at the top of `CHANGELOG.md`, and refresh the
+  "currently …" summary in the `## Files` bullet above.
+- Every user-visible **feature** and **bug fix** that is new *compared to the
+  previous released version* is appended to the current version's changelog
+  section **as it is done** — when the feature/fix lands, not retrofitted at
+  release time. This excludes fixes to problems introduced during this same
+  version's development (those are judged by the version they compare against,
+  i.e. what a 1.xx user upgrading to the next release would notice).
+- Version scheme: `A.B` with a two-digit minor (e.g. 1.00 → 1.10); a `- <date>`
+  ISO-dated entry per version.
 
 ## License
 

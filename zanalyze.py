@@ -52,11 +52,12 @@ import ctypes
 import json
 import math
 import os
+import shutil
 import sys
 import time
 from collections import Counter
 
-__version__ = "1.00"
+__version__ = "1.10"
 
 Z_OK = 0
 Z_STREAM_END = 1
@@ -2507,15 +2508,20 @@ class Progress:
     is space-padded to the longest frame seen so far so a shorter frame fully
     overwrites the previous one. On ``finish`` a final "Decoding finished ..."
     line with the average rate is printed. It is enabled only when the caller
-    allows it *and* stderr is a TTY, so piped or redirected runs are silent."""
+    allows it *and* stderr is a TTY, so piped or redirected runs are silent.
+    When running on CPython without a ``pypy3`` on PATH, a one-shot hint that
+    installing pypy3 could roughly double the decode speed is appended to the
+    frame once the parse has taken ``hint_after`` seconds (default 2s)."""
     __slots__ = (
         "enabled",
         "fh",
+        "hint_after",
         "interval",
         "label",
         "last_len",
         "last_time",
         "t0",
+        "tip",
         "total",
     )
 
@@ -2526,6 +2532,11 @@ class Progress:
         self.label = label
         self.fh = fh if fh is not None else sys.stderr
         self.enabled = bool(enabled) and self.fh.isatty() and total > 0
+        # A pypy3 hint is only relevant if we are not already on PyPy and no
+        # pypy3 is installed (the auto-prefer re-exec would have used one).
+        self.tip = (sys.implementation.name != "pypy"
+                    and shutil.which("pypy3") is None)
+        self.hint_after = 2.0
         # Seed so the first update always renders (monotonic() may be small).
         self.last_time = -interval
         self.t0 = time.monotonic()
@@ -2564,6 +2575,8 @@ class Progress:
         line = (f"{label}[{bar}] {frac * 100:3.0f}%  "
                 f"{_human_bytes(done)}/{_human_bytes(self.total)}  "
                 f"{_human_rate(rate)}/s")
+        if self.tip and elapsed >= self.hint_after:
+            line += "  [tip: install pypy3 for ~2x decode speed]"
         # Pad to the longest frame so far so a shorter one erases the rest.
         if len(line) < self.last_len:
             line += " " * (self.last_len - len(line))
@@ -3286,8 +3299,41 @@ def add_progress_opt(subparser):
                                 "(shown automatically on a TTY)")
 
 
+def add_pypy_opt(parser):
+    """Add --no-pypy, accepted anywhere so it can veto the pypy3 re-exec."""
+    parser.add_argument("--no-pypy", action="store_true",
+                        help="do not re-execute under a pypy3 found on PATH "
+                             "(that is auto-preferred otherwise)")
+
+
+def _prefer_pypy3():
+    """Re-execute under a `pypy3` on PATH unless we already run on PyPy.
+
+    Direct launches (`./zanalyze.py`) go through the `#!/usr/bin/env python3`
+    shebang, and a shebang cannot express an interpreter fallback chain. When a
+    `pypy3` is found on PATH this re-runs the script under it (PyPy's JIT can
+    be faster for the pure-Python bit-level parsing on large streams). Skip
+    cases: already on PyPy, `pypy3` absent, or `ZANALYZE_NO_PYPY` set / a
+    `--no-pypy` flag given to force plain CPython. The flag is scanned
+    directly from `sys.argv` because this runs before argparse parses.
+    `ZANALYZE_ALREADY_PYPY` is set before the exec so a mislabelled `pypy3`
+    (e.g. a python3 alias) cannot loop forever.
+    """
+    if (os.environ.get("ZANALYZE_NO_PYPY") or "--no-pypy" in sys.argv
+            or sys.implementation.name == "pypy"
+            or os.environ.get("ZANALYZE_ALREADY_PYPY")):
+        return
+    prog = shutil.which("pypy3")
+    if not prog:
+        return
+    env = dict(os.environ)
+    env["ZANALYZE_ALREADY_PYPY"] = "1"
+    os.execve(prog, [prog, sys.argv[0]] + sys.argv[1:], env)
+
+
 def main():
     """Parse CLI arguments and dispatch to the analyze/analyze-file/diff modes."""
+    _prefer_pypy3()
     parser = argparse.ArgumentParser(
         prog="zanalyze.py",
         description="Analyze/diff deflate streams produced by zlib(-ng) libraries.",
@@ -3295,6 +3341,7 @@ def main():
                "report details and examples.")
     parser.add_argument("--version", action="version",
                         version=f"%(prog)s {__version__}")
+    add_pypy_opt(parser)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_analyze = sub.add_parser("analyze", help="analyze one library's stream")
@@ -3323,6 +3370,7 @@ def main():
                                 "bits)")
     add_map_opts(p_analyze)
     add_progress_opt(p_analyze)
+    add_pypy_opt(p_analyze)
     p_analyze.add_argument("--no-verify", action="store_true",
                            help="skip the inflate check (the stream is still "
                                 "parsed and verified internally)")
@@ -3366,6 +3414,7 @@ def main():
                                       "bits)")
     add_map_opts(p_analyze_file)
     add_progress_opt(p_analyze_file)
+    add_pypy_opt(p_analyze_file)
     p_analyze_file.add_argument("--json", action="store_true",
                                 help="print machine-parseable JSON instead of "
                                      "the human-readable report")
@@ -3382,6 +3431,7 @@ def main():
     add_compression_opts(p_diff)
     add_map_opts(p_diff)
     add_progress_opt(p_diff)
+    add_pypy_opt(p_diff)
     p_diff.add_argument("--sweep", action="store_true",
                         help="compact per-level report instead of full diff")
     p_diff.add_argument("--levels", default="1-9",

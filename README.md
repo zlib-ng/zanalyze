@@ -34,11 +34,18 @@ Single-file python script. No third-party dependencies.
 
 ## Requirements
 
-- Python **3.10+** (standard library only; CI runs on 3.12).
+- Python **3.10+** (standard library only; CI runs on 3.12, also verified on
+  PyPy 3.11).
 - A zlib or zlib-ng **shared library** (`libz.so` / `libz-ng.so`) to drive
   compression. `analyze-file` mode uses system zlib to recover the source.
 - The libraries are loaded with `RTLD_LOCAL | RTLD_DEEPBIND`, so several
   builds can coexist in one process — handy for `diff`.
+
+Direct launch (`./zanalyze.py`) and the `python3 zanalyze.py` form run on
+whichever interpreter is first on the shebang/`python3`; if a `pypy3` binary
+is on `PATH`, the script re-executes itself under it (PyPy's JIT helps the
+pure-Python bit-level parser on large files). Set `ZANALYZE_NO_PYPY=1` or
+pass `--no-pypy` to force plain CPython.
 
 ## Quick start
 
