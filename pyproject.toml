@@ -1,0 +1,45 @@
+[tool.ruff.lint]
+# Keeps Ruff's default rules active, while explicitly opting into optimization checks
+extend-select = [
+    "PERF",  # Perflint: Targets memory leaks, slow loops, and bad object creation
+    "B",     # Flake8-Bugbear: Finds performance bugs and design flaws
+    "C4",    # Flake8-Comprehensions: Optimizes map/filter/list transformations
+    "UP",    # Pyupgrade: Upgrades legacy syntax to faster, modern Python syntax
+    "FURB",  # Refurb: Refactors code into highly optimized idiomatic patterns
+    "W",     # Whitespace warnings
+    "E",     # Style errors
+    "F",     # Pyflakes
+    "A",     # Name shadowing
+]
+
+ignore = [
+    "E501",  # Line too long
+]
+
+# Pragmatic profile: type-check the bodies of unannotated functions so real
+# type mistakes are caught, without requiring every function to carry a full
+# annotation (disallow_untyped_defs stays off).
+[tool.mypy]
+python_version = "3.14"
+check_untyped_defs = true
+strict_optional = true
+no_implicit_optional = true
+warn_return_any = true
+warn_redundant_casts = true
+warn_unused_configs = true
+warn_unused_ignores = true
+warn_unreachable = true
+
+# Standard: no Error/Fatal/Warning (E/F/W), and docstrings required (C0115/C0116).
+# Convention (C) and Refactor (R) checks are disabled wholesale: for a
+# single-file CLI tool they are style/structural noise. W0201 is disabled
+# because the ctypes z_stream fields are set outside __init__.
+[tool.pylint.MAIN]
+py-version = "3.14"
+ignore = ["__pycache__"]
+disable = ["C", "R", "W0201"]
+enable = ["C0115", "C0116"]
+
+[tool.pylint.REPORTS]
+output-format = "text"
+score = true
