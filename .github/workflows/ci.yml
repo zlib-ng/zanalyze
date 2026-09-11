@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality:
+    name: Linters & type check (ruff, mypy, pylint)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tools
+        run: python -m pip install ruff mypy pylint
+      - name: Ruff
+        run: ruff check zanalyze.py test_zanalyze.py
+      - name: Mypy
+        run: mypy zanalyze.py test_zanalyze.py
+      - name: Pylint
+        run: pylint zanalyze.py test_zanalyze.py
+
+  test:
+    name: Tests (zlib-ng ${{ matrix.ref }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: [develop]
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+        with:
+          path: project
+      - name: Install build tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y cmake build-essential
+      - name: Checkout zlib-ng
+        uses: actions/checkout@v4
+        with:
+          repository: zlib-ng/zlib-ng
+          ref: ${{ matrix.ref }}
+          path: zlib-ng
+      - name: Build zlib-ng
+        run: |
+          cmake -S zlib-ng -B zlib-ng/build
+          cmake --build zlib-ng/build -j4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run tests
+        env:
+          ZANALYZE_TEST_DATA: ${{ github.workspace }}/zlib-ng/test/data/lcet10.txt
+        run: python3 project/test_zanalyze.py zlib-ng/build/libz-ng.so
